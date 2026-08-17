@@ -2,8 +2,8 @@
 #include <stdio.h>
 #include <cuda_runtime.h>
 #include <time.h>
+#include <math.h>
 
-#define BATCH_SIZE 1
 #define INPUT_MATRIX_SIZE 28
 #define INPUT_LAYER_SIZE 784
 #define HIDDEN_LAYER_SIZE 128
@@ -35,6 +35,7 @@ float *h_output_layer_2, *h_weight_layer_23, *h_bias_layer_23;
 float *d_input_layer_1, *d_input_layer_2, *d_weight_layer_12, *d_bias_layer_12;
 // 2nd device layer
 float *d_output_layer_2, *d_weight_layer_23, *d_bias_layer_23;
+int BATCH_SIZE;
 
 __global__ void mac_kernel(float *A, float *B, float *C, float *bias, int M, int K, int N)
 {
@@ -133,9 +134,9 @@ inline void move_data_to_device()
     CHECK_CUDA_ERROR(cudaMemcpy(d_bias_layer_23, h_bias_layer_23, OUTPUT_LAYER_SIZE * sizeof(float), cudaMemcpyHostToDevice));
 }
 
-inline void forward_pass()
+inline void forward_pass(int block_y)
 {
-    dim3 threadsperBlock(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 threadsperBlock(BLOCK_SIZE, block_y);
     // 1st layer
     dim3 blocksperGrid1((HIDDEN_LAYER_SIZE + threadsperBlock.x - 1) / threadsperBlock.x, (BATCH_SIZE + threadsperBlock.y - 1) / threadsperBlock.y);
     mac_kernel<<<blocksperGrid1, threadsperBlock>>>(d_input_layer_1, d_weight_layer_12, d_input_layer_2, d_bias_layer_12, BATCH_SIZE, INPUT_LAYER_SIZE, HIDDEN_LAYER_SIZE);
@@ -170,6 +171,10 @@ inline void free_memory()
 
 int main()
 {
+    printf("Enter the batch size: ");
+    scanf("%d", &BATCH_SIZE);
+    printf("\n");
+    int block_y = (BATCH_SIZE > BLOCK_SIZE) ? BLOCK_SIZE : BATCH_SIZE;
     allocate_memory();
     // give input
     read_file((char *)"binary_files/input.bin", h_input_layer_1, BATCH_SIZE * INPUT_LAYER_SIZE);
@@ -184,33 +189,30 @@ int main()
     normalise_kernel<<<blocksperGridNorm, threadperBlockNorm>>>(d_input_layer_1, BATCH_SIZE * INPUT_LAYER_SIZE);
     CHECK_CUDA_ERROR(cudaPeekAtLastError());
     // forward_pass
-    forward_pass();
+    forward_pass(block_y);
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
     double end_compute_time = get_time();
     CHECK_CUDA_ERROR(cudaMemcpy(h_output_layer_2, d_output_layer_2, BATCH_SIZE * OUTPUT_LAYER_SIZE * sizeof(float), cudaMemcpyDeviceToHost));
     double end_inference_time = get_time();
 
+    int final_prediction[BATCH_SIZE];
     for (int i = 0; i < BATCH_SIZE; i++)
     {
+        float output = h_output_layer_2[i * OUTPUT_LAYER_SIZE + 0];
+        float idx = 0;
         for (int j = 0; j < OUTPUT_LAYER_SIZE; j++)
         {
-            printf("%f ", h_output_layer_2[i * OUTPUT_LAYER_SIZE + j]);
+            if (h_output_layer_2[i * OUTPUT_LAYER_SIZE + j] > output)
+            {
+                output = h_output_layer_2[i * OUTPUT_LAYER_SIZE + j];
+                idx = j;
+            }
         }
-        printf("\n");
+        final_prediction[i] = (int)idx;
     }
     free_memory();
-
-    // for (int i = 0; i < BATCH_SIZE; i++)
-    // {
-    //     float output = h_output_layer_2[0];
-    //     float idx = 0;
-    //     for (int j = 0; j < OUTPUT_LAYER_SIZE; j++)
-    //     {
-    //         if (h_output_layer_2[i * OUTPUT_LAYER_SIZE + j] > output)
-    //         {
-    //             output = h_output_layer_2[i * OUTPUT_LAYER_SIZE + j];
-    //             idx = j;
-    //         }
-    //     }
-    // }
+    for (int i = 0; i < BATCH_SIZE; i++)
+    {
+        printf("Final Prediction for input %d: %d\n", i, final_prediction[i]);
+    }
 }
