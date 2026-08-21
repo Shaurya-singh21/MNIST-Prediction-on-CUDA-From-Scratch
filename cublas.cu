@@ -1,7 +1,6 @@
-#include <cuda_runtime.h>
-#include <time.h>
-#include <stdlib.h>
 #include <stdio.h>
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 #define INPUT_MATRIX_SIZE 28
 #define INPUT_LAYER_SIZE 784
@@ -24,6 +23,7 @@ inline void check(cudaError_t code, const char *file, int line, bool abort = tru
             exit(code);
     }
 }
+
 // 1st host layer
 float *h_input_layer_1, *h_weight_layer_12, *h_bias_layer_12;
 // 2nd host layer
@@ -35,52 +35,30 @@ float *d_input_layer_1, *d_input_layer_2, *d_weight_layer_12, *d_bias_layer_12;
 float *d_output_layer_2, *d_weight_layer_23, *d_bias_layer_23;
 int PADDED_BATCH_SIZE;
 
-__global__ void tiled_matmul(float *A, float *B, float *C, float *bias, int M, int K, int N)
+// __global__ void mac_kernel(float *A, float *B, float *C, float *bias, int M, int K, int N)
+// {
+//     int row = blockIdx.x * blockDim.x + threadIdx.x;
+//     int col = blockIdx.y * blockDim.y + threadIdx.y;
+//     if (row < M && col < N)
+//     {
+//         float sum = 0.0f;
+//         for (int i = 0; i < K; i++)
+//         {
+//             sum += A[row * K + i] * B[i * N + col];
+//         }
+//         C[row * N + col] = sum + bias[row];
+//     }
+// }
+
+__global__ void add_bias(float *A, float *bias, int size, int columns)
 {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-
-    __shared__ float sA[BLOCK_SIZE][BLOCK_SIZE];
-    __shared__ float sB[BLOCK_SIZE][BLOCK_SIZE];
-
-    int phases = (K + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    float sum = 0.0f;
-    for (int i = 0; i < phases; i++)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size)
     {
-        // capture data from vram for a thread which will do the dot product
-        // row fixed
-        if (row < M && (i * BLOCK_SIZE + threadIdx.x) < K)
-        {
-            sA[threadIdx.y][threadIdx.x] = A[row * K + (i * BLOCK_SIZE + threadIdx.x)];
-        }
-        else
-        {
-            sA[threadIdx.y][threadIdx.x] = 0.0f;
-        }
-
-        // col fixed
-        if (col < N && (i * BLOCK_SIZE + threadIdx.y) < K)
-        {
-            sB[threadIdx.y][threadIdx.x] = B[(i * BLOCK_SIZE + threadIdx.y) * N + col];
-        }
-        else
-        {
-            sB[threadIdx.y][threadIdx.x] = 0.0f;
-        }
-
-        __syncthreads();
-
-        for (int i = 0; i < BLOCK_SIZE; i++)
-        {
-            sum += sA[threadIdx.y][i] * sB[i][threadIdx.x];
-        }
-    }
-
-    if (row < M && col < N)
-    {
-        C[row * N + col] = sum + bias[col];
+        A[idx] += bias[idx % columns];
     }
 }
+
 __global__ void ReLU(float *A, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -163,21 +141,33 @@ inline void move_data_to_device()
     CHECK_CUDA_ERROR(cudaMemcpy(d_bias_layer_23, h_bias_layer_23, OUTPUT_LAYER_SIZE * sizeof(float), cudaMemcpyHostToDevice));
 }
 
-inline void forward_pass()
+inline void forward_pass(cublasHandle_t handle)
 {
-    dim3 threadsperBlock(BLOCK_SIZE, BLOCK_SIZE);
+    float alpha = 1.0f, beta = 0.0f;
     // 1st layer
-    dim3 blocksperGrid1((HIDDEN_LAYER_SIZE + threadsperBlock.x - 1) / threadsperBlock.x, (PADDED_BATCH_SIZE + threadsperBlock.y - 1) / threadsperBlock.y);
-    tiled_matmul<<<blocksperGrid1, threadsperBlock>>>(d_input_layer_1, d_weight_layer_12, d_input_layer_2, d_bias_layer_12, PADDED_BATCH_SIZE, INPUT_LAYER_SIZE, HIDDEN_LAYER_SIZE);
+    cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, HIDDEN_LAYER_SIZE, PADDED_BATCH_SIZE, INPUT_LAYER_SIZE, &alpha, d_weight_layer_12, HIDDEN_LAYER_SIZE, d_input_layer_1, INPUT_LAYER_SIZE, &beta, d_input_layer_2, HIDDEN_LAYER_SIZE);
     CHECK_CUDA_ERROR(cudaPeekAtLastError());
-    // RELU LAYER
+
+    // relu
     dim3 threadperBlockReLU(BLOCK_SIZE * BLOCK_SIZE);
     dim3 blocksperGridRelu((HIDDEN_LAYER_SIZE * PADDED_BATCH_SIZE + threadperBlockReLU.x - 1) / threadperBlockReLU.x);
     ReLU<<<blocksperGridRelu, threadperBlockReLU>>>(d_input_layer_2, HIDDEN_LAYER_SIZE * PADDED_BATCH_SIZE);
     CHECK_CUDA_ERROR(cudaPeekAtLastError());
+
+    // add bias
+    dim3 threadperBlockBias1(BLOCK_SIZE * BLOCK_SIZE);
+    dim3 blocksperGridBias1((HIDDEN_LAYER_SIZE * PADDED_BATCH_SIZE + threadperBlockBias1.x - 1) / threadperBlockBias1.x);
+    add_bias<<<blocksperGridBias1, threadperBlockBias1>>>(d_input_layer_2, d_bias_layer_12, HIDDEN_LAYER_SIZE * PADDED_BATCH_SIZE, HIDDEN_LAYER_SIZE);
+    CHECK_CUDA_ERROR(cudaPeekAtLastError());
+
     // 2nd layer
-    dim3 blocksperGrid2((OUTPUT_LAYER_SIZE + threadsperBlock.x - 1) / threadsperBlock.x, (PADDED_BATCH_SIZE + threadsperBlock.y - 1) / threadsperBlock.y);
-    tiled_matmul<<<blocksperGrid2, threadsperBlock>>>(d_input_layer_2, d_weight_layer_23, d_output_layer_2, d_bias_layer_23, PADDED_BATCH_SIZE, HIDDEN_LAYER_SIZE, OUTPUT_LAYER_SIZE);
+    cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, OUTPUT_LAYER_SIZE, PADDED_BATCH_SIZE, HIDDEN_LAYER_SIZE, &alpha, d_weight_layer_23, OUTPUT_LAYER_SIZE, d_input_layer_2, HIDDEN_LAYER_SIZE, &beta, d_output_layer_2, OUTPUT_LAYER_SIZE);
+    CHECK_CUDA_ERROR(cudaPeekAtLastError());
+
+    // add bias 2
+    dim3 threadperBlockBias2(BLOCK_SIZE * BLOCK_SIZE);
+    dim3 blocksperGridBias2((PADDED_BATCH_SIZE * OUTPUT_LAYER_SIZE + threadperBlockBias2.x - 1) / threadperBlockBias2.x);
+    add_bias<<<blocksperGridBias2, threadperBlockBias2>>>(d_output_layer_2, d_bias_layer_23, PADDED_BATCH_SIZE * OUTPUT_LAYER_SIZE, OUTPUT_LAYER_SIZE);
     CHECK_CUDA_ERROR(cudaPeekAtLastError());
 }
 
@@ -206,15 +196,16 @@ int main()
     printf("\n");
     PADDED_BATCH_SIZE = (BATCH_SIZE + 15) / BLOCK_SIZE * BLOCK_SIZE;
     allocate_memory();
+    cublasHandle_t handle;
+    cublasCreate(&handle);
     // give input
     read_file((char *)"binary_files/input.bin", h_input_layer_1, BATCH_SIZE * INPUT_LAYER_SIZE);
     // initialize weights and biases
     initialize_weights();
-    // move data to device
-    move_data_to_device();
     double start_inference_time = get_time();
-    CHECK_CUDA_ERROR(cudaMemset(d_input_layer_1 + (BATCH_SIZE * INPUT_LAYER_SIZE), 0.0, ((PADDED_BATCH_SIZE - BATCH_SIZE) * INPUT_LAYER_SIZE) * sizeof(float)));
-    CHECK_CUDA_ERROR(cudaDeviceSynchronize());
+    move_data_to_device();
+    cudaMemset(d_input_layer_1 + (BATCH_SIZE * INPUT_LAYER_SIZE), 0.0, ((PADDED_BATCH_SIZE - BATCH_SIZE) * INPUT_LAYER_SIZE) * sizeof(float));
+    cudaDeviceSynchronize();
     double start_compute_time = get_time();
     // normalise the inputs
     dim3 threadperBlockNorm(BLOCK_SIZE * BLOCK_SIZE);
@@ -222,7 +213,7 @@ int main()
     normalise_kernel<<<blocksperGridNorm, threadperBlockNorm>>>(d_input_layer_1, PADDED_BATCH_SIZE * INPUT_LAYER_SIZE);
     CHECK_CUDA_ERROR(cudaPeekAtLastError());
     // forward_pass
-    forward_pass();
+    forward_pass(handle);
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
     double end_compute_time = get_time();
     CHECK_CUDA_ERROR(cudaMemcpy(h_output_layer_2, d_output_layer_2, PADDED_BATCH_SIZE * OUTPUT_LAYER_SIZE * sizeof(float), cudaMemcpyDeviceToHost));
@@ -244,14 +235,10 @@ int main()
         final_prediction[i] = (int)idx;
     }
     free_memory();
-    for (int i = 0; i < BATCH_SIZE; i++)
-    {
-        printf("Final Prediction for input %d: %d\n", i + 1, final_prediction[i]);
-    }
 
     float real_values[BATCH_SIZE];
-    printf("Total Inference Time: %f seconds\n", end_inference_time - start_inference_time);
-    printf("Total Compute Time: %f seconds\n", end_compute_time - start_compute_time);
+    printf("Total Inference Time: %f ms\n", (end_inference_time - start_inference_time) * 1000);
+    printf("Total Compute Time: %f ms\n", (end_compute_time - start_compute_time) * 1000);
 
     printf("Starting accuracy calculation...\n");
     read_file((char *)"binary_files/labels.bin", real_values, BATCH_SIZE);
@@ -259,9 +246,7 @@ int main()
     for (int i = 0; i < BATCH_SIZE; i++)
     {
         if (final_prediction[i] == (int)real_values[i])
-        {
             correct_predictions++;
-        }
     }
     float accuracy = (float)correct_predictions / BATCH_SIZE * 100.0f;
     printf("Accuracy: %.2f%%\n", accuracy);

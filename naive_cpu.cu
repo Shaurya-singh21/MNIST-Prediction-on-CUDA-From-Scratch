@@ -39,8 +39,8 @@ int PADDED_BATCH_SIZE;
 
 __global__ void mac_kernel(float *A, float *B, float *C, float *bias, int M, int K, int N)
 {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = blockIdx.y * blockDim.y + threadIdx.y;
     if (row < M && col < N)
     {
         float sum = 0.0f;
@@ -48,7 +48,7 @@ __global__ void mac_kernel(float *A, float *B, float *C, float *bias, int M, int
         {
             sum += A[row * K + i] * B[i * N + col];
         }
-        C[row * N + col] = sum + bias[col];
+        C[row * N + col] = sum + bias[row];
     }
 }
 
@@ -138,7 +138,7 @@ inline void forward_pass()
 {
     dim3 threadsperBlock(BLOCK_SIZE, BLOCK_SIZE);
     // 1st layer
-    dim3 blocksperGrid1((HIDDEN_LAYER_SIZE + threadsperBlock.x - 1) / threadsperBlock.x, (PADDED_BATCH_SIZE + threadsperBlock.y - 1) / threadsperBlock.y);
+    dim3 blocksperGrid1((PADDED_BATCH_SIZE + threadsperBlock.y - 1) / threadsperBlock.y, (HIDDEN_LAYER_SIZE + threadsperBlock.x - 1) / threadsperBlock.x);
     mac_kernel<<<blocksperGrid1, threadsperBlock>>>(d_input_layer_1, d_weight_layer_12, d_input_layer_2, d_bias_layer_12, PADDED_BATCH_SIZE, INPUT_LAYER_SIZE, HIDDEN_LAYER_SIZE);
     CHECK_CUDA_ERROR(cudaPeekAtLastError());
     // RELU LAYER
@@ -147,7 +147,7 @@ inline void forward_pass()
     ReLU<<<blocksperGridRelu, threadperBlockReLU>>>(d_input_layer_2, HIDDEN_LAYER_SIZE * PADDED_BATCH_SIZE);
     CHECK_CUDA_ERROR(cudaPeekAtLastError());
     // 2nd layer
-    dim3 blocksperGrid2((OUTPUT_LAYER_SIZE + threadsperBlock.x - 1) / threadsperBlock.x, (PADDED_BATCH_SIZE + threadsperBlock.y - 1) / threadsperBlock.y);
+    dim3 blocksperGrid2((PADDED_BATCH_SIZE + threadsperBlock.y - 1) / threadsperBlock.y, (OUTPUT_LAYER_SIZE + threadsperBlock.x - 1) / threadsperBlock.x);
     mac_kernel<<<blocksperGrid2, threadsperBlock>>>(d_input_layer_2, d_weight_layer_23, d_output_layer_2, d_bias_layer_23, PADDED_BATCH_SIZE, HIDDEN_LAYER_SIZE, OUTPUT_LAYER_SIZE);
     CHECK_CUDA_ERROR(cudaPeekAtLastError());
 }
@@ -214,14 +214,10 @@ int main()
         final_prediction[i] = (int)idx;
     }
     free_memory();
-    for (int i = 0; i < BATCH_SIZE; i++)
-    {
-        printf("Final Prediction for input %d: %d\n", i + 1, final_prediction[i]);
-    }
 
     float real_values[BATCH_SIZE];
-    printf("Total Inference Time: %f seconds\n", end_inference_time - start_inference_time);
-    printf("Total Compute Time: %f seconds\n", end_compute_time - start_compute_time);
+    printf("Total Inference Time: %f ms\n", (end_inference_time - start_inference_time) * 1000);
+    printf("Total Compute Time: %f ms\n", (end_compute_time - start_compute_time) * 1000);
 
     printf("Starting accuracy calculation...\n");
     read_file((char *)"binary_files/labels.bin", real_values, BATCH_SIZE);
@@ -229,10 +225,7 @@ int main()
     for (int i = 0; i < BATCH_SIZE; i++)
     {
         if (final_prediction[i] == (int)real_values[i])
-        {
             correct_predictions++;
-        }
-        printf("Real value: %d, Predicted value: %d\n", (int)real_values[i], final_prediction[i]);
     }
     float accuracy = (float)correct_predictions / BATCH_SIZE * 100.0f;
     printf("Accuracy: %.2f%%\n", accuracy);
